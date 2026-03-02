@@ -1,0 +1,519 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Battle Royale</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #1a1a2e; color: #fff; font-family: 'Segoe UI', sans-serif; overflow: hidden; }
+  #canvas { display: block; cursor: crosshair; }
+  #ui { position: fixed; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+  #hud { position: fixed; bottom: 20px; left: 20px; }
+  #healthBar { width: 200px; height: 18px; background: #333; border-radius: 9px; overflow: hidden; border: 2px solid #555; }
+  #healthFill { height: 100%; background: linear-gradient(90deg, #e74c3c, #2ecc71); transition: width 0.1s; border-radius: 7px; }
+  #weaponInfo { margin-top: 8px; font-size: 14px; color: #ddd; }
+  #killFeed { position: fixed; top: 20px; right: 20px; text-align: right; }
+  .kill-msg { background: rgba(0,0,0,0.6); padding: 4px 10px; border-radius: 4px; margin-bottom: 4px; font-size: 13px; animation: fadeOut 3s forwards; }
+  @keyframes fadeOut { 0%{opacity:1} 70%{opacity:1} 100%{opacity:0} }
+  #zoneTimer { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); background: rgba(0,0,0,0.6); padding: 6px 16px; border-radius: 20px; font-size: 14px; color: #a0f0ff; }
+  #overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); display: flex; flex-direction: column; align-items: center; justify-content: center; pointer-events: all; }
+  #overlay h1 { font-size: 48px; margin-bottom: 10px; color: #f39c12; text-shadow: 0 0 20px #f39c12; }
+  #overlay p { font-size: 18px; color: #aaa; margin-bottom: 20px; }
+  #overlay input { padding: 10px 16px; font-size: 16px; border-radius: 8px; border: 2px solid #f39c12; background: #1a1a2e; color: #fff; outline: none; margin-bottom: 16px; text-align: center; width: 220px; }
+  #overlay button { padding: 12px 32px; font-size: 18px; border-radius: 8px; border: none; background: #f39c12; color: #1a1a2e; font-weight: bold; cursor: pointer; transition: 0.2s; pointer-events: all; }
+  #overlay button:hover { background: #e67e22; transform: scale(1.05); }
+  #countdown { position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); font-size: 120px; font-weight: bold; color: #f39c12; text-shadow: 0 0 40px #f39c12; animation: pop 0.3s ease-out; pointer-events: none; }
+  @keyframes pop { from{transform:translate(-50%,-50%) scale(0.5);opacity:0} to{transform:translate(-50%,-50%) scale(1);opacity:1} }
+  #minimap { position: fixed; bottom: 20px; right: 20px; border: 2px solid #555; border-radius: 4px; }
+  #controls { position: fixed; top: 60px; left: 20px; font-size: 12px; color: #888; line-height: 1.6; }
+  #playerCount { position: fixed; top: 20px; left: 20px; font-size: 14px; color: #aaa; }
+  #waitMsg { position: fixed; top: 50%; left: 50%; transform: translate(-50%,-50%); font-size: 22px; color: #aaa; pointer-events: none; text-align: center; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<canvas id="minimap" width="150" height="150"></canvas>
+<div id="ui">
+  <div id="hud">
+    <div id="healthBar"><div id="healthFill" style="width:100%"></div></div>
+    <div id="weaponInfo">Fists | ∞</div>
+  </div>
+  <div id="killFeed"></div>
+  <div id="zoneTimer"></div>
+  <div id="playerCount"></div>
+  <div id="controls">WASD / Arrow keys: Move<br>Mouse: Aim<br>Click / Space: Attack<br>E: Pick up item</div>
+</div>
+<div id="overlay">
+  <h1>⚔️ Battle Royale</h1>
+  <p>Last one standing wins!</p>
+  <input id="nameInput" maxlength="12" placeholder="Enter your name" />
+  <button id="joinBtn">Join Game</button>
+</div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+const minimap = document.getElementById('minimap');
+const mctx = minimap.getContext('2d');
+
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+
+window.addEventListener('resize', () => {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+});
+
+const socket = io();
+
+let myId = null;
+let mapWidth = 1600, mapHeight = 1600;
+let weapons = {};
+let state = null;
+let camera = { x: 0, y: 0 };
+let mouseWorld = { x: 0, y: 0 };
+let keys = {};
+let lastMoveTime = 0;
+let joined = false;
+let countdownDisplay = null;
+let showWait = false;
+
+const SPEED = 180;
+
+document.getElementById('joinBtn').addEventListener('click', () => {
+  const name = document.getElementById('nameInput').value.trim() || 'Player';
+  socket.emit('setName', name);
+  document.getElementById('overlay').style.display = 'none';
+  joined = true;
+});
+
+document.getElementById('nameInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') document.getElementById('joinBtn').click();
+});
+
+socket.on('init', (data) => {
+  myId = data.id;
+  mapWidth = data.mapWidth;
+  mapHeight = data.mapHeight;
+  weapons = data.weapons;
+});
+
+socket.on('serverFull', () => {
+  alert('Server is full (max 4 players)!');
+});
+
+socket.on('gameState', (s) => {
+  const wasOver = state && state.gameOver;
+  state = s;
+  updateHUD();
+  updateMinimap();
+  updateZoneTimer();
+  updatePlayerCount();
+
+  if (s.countdown !== null && s.countdown > 0) {
+    showCountdown(s.countdown);
+  }
+
+  // Hide overlay and reset local state when game resets after game over
+  if (wasOver && !s.gameOver) {
+    const overlay = document.getElementById('overlay');
+    overlay.style.display = 'none';
+    overlay.style.pointerEvents = 'none';
+    // Reset joined flag so player is treated as alive again
+    joined = true;
+  }
+
+  showWait = !s.gameStarted && s.countdown === null && !s.gameOver;
+});
+
+socket.on('gameOver', (data) => {
+  setTimeout(() => {
+    const overlay = document.getElementById('overlay');
+    overlay.innerHTML = `
+      <h1>${data.winner === 'Nobody' ? '💀 Draw!' : '🏆 ' + data.winner + ' Wins!'}</h1>
+      <p>GG!</p>
+      <button id="restartBtn">Play Again (0/?)</button>
+    `;
+    overlay.style.display = 'flex';
+    overlay.style.pointerEvents = 'all';
+    let voted = false;
+    document.getElementById('restartBtn').addEventListener('click', () => {
+      if (voted) return;
+      voted = true;
+      document.getElementById('restartBtn').style.opacity = '0.6';
+      document.getElementById('restartBtn').textContent = document.getElementById('restartBtn').textContent.replace('Play Again', 'Waiting...');
+      socket.emit('voteRestart');
+    });
+  }, 1000);
+});
+
+socket.on('restartVote', (data) => {
+  const btn = document.getElementById('restartBtn');
+  if (btn) {
+    const label = btn.textContent.includes('Waiting') ? 'Waiting...' : 'Play Again';
+    btn.textContent = `${label} (${data.ready}/${data.total})`;
+  }
+});
+
+socket.on('playerDied', (data) => {
+  addKillFeedMsg(data.killer === 'zone'
+    ? `☠️ Player eliminated by zone`
+    : `⚔️ ${data.killer} eliminated a player`);
+  if (data.id === myId) {
+    setTimeout(() => {
+      const overlay = document.getElementById('overlay');
+      overlay.innerHTML = `
+        <h1>💀 You Died</h1>
+        <p>Spectating until game ends...</p>
+      `;
+      overlay.style.display = 'flex';
+      overlay.style.pointerEvents = 'none';
+    }, 500);
+  }
+});
+
+function addKillFeedMsg(msg) {
+  const feed = document.getElementById('killFeed');
+  const el = document.createElement('div');
+  el.className = 'kill-msg';
+  el.textContent = msg;
+  feed.appendChild(el);
+  setTimeout(() => el.remove(), 3000);
+}
+
+function showCountdown(n) {
+  let el = document.getElementById('countdown');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'countdown';
+    document.body.appendChild(el);
+  }
+  el.textContent = n;
+  el.style.display = 'block';
+  // re-trigger animation
+  el.style.animation = 'none';
+  el.offsetHeight;
+  el.style.animation = 'pop 0.3s ease-out';
+  setTimeout(() => { if (el) el.style.display = 'none'; }, 900);
+}
+
+function updateHUD() {
+  if (!state || !myId || !state.players[myId]) return;
+  const p = state.players[myId];
+  document.getElementById('healthFill').style.width = Math.max(0, p.hp) + '%';
+  const w = weapons[p.weapon];
+  const ammoStr = p.ammo === Infinity ? '∞' : p.ammo;
+  document.getElementById('weaponInfo').textContent = (w ? w.name : 'Fists') + ' | ' + ammoStr;
+}
+
+function updateZoneTimer() {
+  if (!state) return;
+  const z = state.zone;
+  const el = document.getElementById('zoneTimer');
+  if (z.shrinking) {
+    el.textContent = '🔴 Zone shrinking!';
+    el.style.color = '#ff6b6b';
+  } else {
+    el.textContent = `⏱ Zone shrinks in ${Math.ceil(z.shrinkTimer)}s`;
+    el.style.color = '#a0f0ff';
+  }
+}
+
+function updatePlayerCount() {
+  if (!state) return;
+  const alive = Object.values(state.players).filter(p => p.alive).length;
+  document.getElementById('playerCount').textContent = `👥 ${alive} alive`;
+}
+
+function updateMinimap() {
+  if (!state) return;
+  mctx.clearRect(0, 0, 150, 150);
+  mctx.fillStyle = '#1a2a1a';
+  mctx.fillRect(0, 0, 150, 150);
+
+  const scale = 150 / mapWidth;
+
+  // Zone
+  const z = state.zone;
+  mctx.strokeStyle = 'rgba(0, 150, 255, 0.6)';
+  mctx.lineWidth = 1.5;
+  mctx.beginPath();
+  mctx.arc(z.x * scale, z.y * scale, z.radius * scale, 0, Math.PI * 2);
+  mctx.stroke();
+
+  // Pickups
+  mctx.fillStyle = '#f39c12';
+  state.pickups.forEach(pk => {
+    mctx.fillRect(pk.x * scale - 1, pk.y * scale - 1, 2, 2);
+  });
+
+  // Players
+  for (const id in state.players) {
+    const p = state.players[id];
+    if (!p.alive) continue;
+    mctx.fillStyle = id === myId ? '#fff' : p.color;
+    mctx.beginPath();
+    mctx.arc(p.x * scale, p.y * scale, id === myId ? 3 : 2, 0, Math.PI * 2);
+    mctx.fill();
+  }
+}
+
+canvas.addEventListener('mousemove', (e) => {
+  if (!state || !myId || !state.players[myId]) return;
+  const p = state.players[myId];
+  mouseWorld.x = p.x + (e.clientX - canvas.width / 2);
+  mouseWorld.y = p.y + (e.clientY - canvas.height / 2);
+});
+
+canvas.addEventListener('click', () => {
+  if (!joined || !state || !state.gameStarted) return;
+  const p = state.players[myId];
+  if (!p || !p.alive) return;
+  const w = weapons[p.weapon];
+  if (!w) return;
+  const angle = Math.atan2(mouseWorld.y - p.y, mouseWorld.x - p.x);
+  if (w.type === 'gun') {
+    socket.emit('shoot', { angle });
+  } else {
+    socket.emit('melee');
+  }
+});
+
+window.addEventListener('keydown', e => {
+  keys[e.key.toLowerCase()] = true;
+  if (e.key === ' ' || e.key === 'Spacebar') {
+    if (!joined || !state || !state.gameStarted) return;
+    const p = state.players[myId];
+    if (!p || !p.alive) return;
+    const w = weapons[p.weapon];
+    if (!w) return;
+    const angle = Math.atan2(mouseWorld.y - p.y, mouseWorld.x - p.x);
+    if (w.type === 'gun') socket.emit('shoot', { angle });
+    else socket.emit('melee');
+  }
+  if (e.key.toLowerCase() === 'e') {
+    if (!state || !state.pickups || !myId) return;
+    const p = state.players[myId];
+    if (!p || !p.alive) return;
+    const nearby = state.pickups.find(pk => Math.hypot(pk.x - p.x, pk.y - p.y) < 60);
+    if (nearby) socket.emit('pickup', nearby.id);
+  }
+});
+window.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+
+let lastFrame = performance.now();
+function gameLoop(now) {
+  requestAnimationFrame(gameLoop);
+  const dt = Math.min((now - lastFrame) / 1000, 0.05);
+  lastFrame = now;
+
+  if (!joined || !state || !myId) {
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    return;
+  }
+
+  const me = state.players[myId];
+
+  // Movement
+  if (me && me.alive && state.gameStarted) {
+    let dx = 0, dy = 0;
+    if (keys['w'] || keys['arrowup']) dy -= 1;
+    if (keys['s'] || keys['arrowdown']) dy += 1;
+    if (keys['a'] || keys['arrowleft']) dx -= 1;
+    if (keys['d'] || keys['arrowright']) dx += 1;
+    if (dx !== 0 && dy !== 0) { dx *= 0.707; dy *= 0.707; }
+    if (dx !== 0 || dy !== 0) {
+      const nx = Math.max(0, Math.min(mapWidth, me.x + dx * SPEED * dt));
+      const ny = Math.max(0, Math.min(mapHeight, me.y + dy * SPEED * dt));
+      me.x = nx; me.y = ny;
+      const angle = Math.atan2(mouseWorld.y - me.y, mouseWorld.x - me.x);
+      const n2 = Date.now();
+      if (n2 - lastMoveTime > 16) {
+        socket.emit('move', { x: nx, y: ny, angle });
+        lastMoveTime = n2;
+      }
+    }
+  }
+
+  // Camera
+  if (me) {
+    camera.x = me.x - canvas.width / 2;
+    camera.y = me.y - canvas.height / 2;
+  }
+
+  // Draw
+  ctx.fillStyle = '#1a2a1a';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  ctx.save();
+  ctx.translate(-camera.x, -camera.y);
+
+  // Grid
+  ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+  ctx.lineWidth = 1;
+  for (let x = 0; x <= mapWidth; x += 100) {
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, mapHeight); ctx.stroke();
+  }
+  for (let y = 0; y <= mapHeight; y += 100) {
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(mapWidth, y); ctx.stroke();
+  }
+
+  // Map border
+  ctx.strokeStyle = '#e74c3c';
+  ctx.lineWidth = 4;
+  ctx.strokeRect(0, 0, mapWidth, mapHeight);
+
+  // Zone
+  if (state.zone) {
+    const z = state.zone;
+    ctx.save();
+    ctx.fillStyle = 'rgba(0, 100, 200, 0.08)';
+    ctx.strokeStyle = z.shrinking ? 'rgba(255, 50, 50, 0.8)' : 'rgba(0, 150, 255, 0.5)';
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(z.x, z.y, z.radius, 0, Math.PI * 2);
+    ctx.stroke();
+    // Danger zone overlay (outside zone)
+    ctx.fillStyle = 'rgba(200, 0, 0, 0.08)';
+    ctx.fillRect(0, 0, mapWidth, mapHeight);
+    ctx.save();
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.beginPath();
+    ctx.arc(z.x, z.y, z.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    ctx.restore();
+  }
+
+  // Pickups
+  if (state.pickups) {
+    state.pickups.forEach(pk => {
+      ctx.save();
+      ctx.translate(pk.x, pk.y);
+      if (pk.type === 'health') {
+        ctx.fillStyle = '#2ecc71';
+        ctx.fillRect(-8, -3, 16, 6);
+        ctx.fillRect(-3, -8, 6, 16);
+      } else {
+        ctx.fillStyle = '#f39c12';
+        ctx.strokeStyle = '#fff';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(0, 0, 8, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke();
+        ctx.fillStyle = '#fff';
+        ctx.font = 'bold 9px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(pk.weapon ? pk.weapon[0].toUpperCase() : 'W', 0, 0);
+      }
+      ctx.restore();
+
+      // Pickup label near player
+      if (me) {
+        const d = Math.hypot(pk.x - me.x, pk.y - me.y);
+        if (d < 60) {
+          ctx.fillStyle = '#fff';
+          ctx.font = '11px sans-serif';
+          ctx.textAlign = 'center';
+          ctx.fillText('[E] ' + (pk.type === 'health' ? 'Health' : pk.weapon), pk.x, pk.y - 16);
+        }
+      }
+    });
+  }
+
+  // Bullets
+  if (state.bullets) {
+    ctx.fillStyle = '#ffe066';
+    state.bullets.forEach(b => {
+      ctx.beginPath();
+      ctx.arc(b.x, b.y, 4, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+
+  // Players
+  for (const id in state.players) {
+    const p = state.players[id];
+    if (!p.alive) continue;
+
+    ctx.save();
+    ctx.translate(p.x, p.y);
+
+    // Shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.3)';
+    ctx.beginPath();
+    ctx.ellipse(0, 10, 14, 6, 0, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Body
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(0, 0, 16, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Outline for self
+    if (id === myId) {
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+    }
+
+    // Direction indicator (weapon)
+    ctx.rotate(p.angle || 0);
+    ctx.fillStyle = '#fff';
+    if (p.weapon === 'pistol') {
+      ctx.fillRect(10, -2, 10, 5);
+    } else if (p.weapon === 'rifle') {
+      ctx.fillRect(10, -2, 22, 4);
+    } else if (p.weapon === 'shotgun') {
+      ctx.fillRect(10, -3, 14, 7);
+    } else if (p.weapon === 'sword') {
+      ctx.fillRect(10, -1, 20, 3);
+    } else if (p.weapon === 'axe') {
+      ctx.fillRect(10, -4, 10, 9);
+    } else {
+      ctx.fillRect(10, -2, 7, 5);
+    }
+    ctx.restore();
+
+    // HP bar
+    ctx.save();
+    ctx.translate(p.x - 20, p.y - 26);
+    ctx.fillStyle = '#333';
+    ctx.fillRect(0, 0, 40, 5);
+    ctx.fillStyle = p.hp > 50 ? '#2ecc71' : p.hp > 25 ? '#f39c12' : '#e74c3c';
+    ctx.fillRect(0, 0, (p.hp / 100) * 40, 5);
+    ctx.restore();
+
+    // Name
+    ctx.fillStyle = id === myId ? '#fff' : '#ddd';
+    ctx.font = `bold 12px sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.fillText(p.name, p.x, p.y - 30);
+  }
+
+  ctx.restore();
+
+  // Wait message
+  if (showWait && joined) {
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 28px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Waiting for players...', canvas.width / 2, canvas.height / 2);
+    ctx.font = '18px sans-serif';
+    ctx.fillStyle = '#aaa';
+    ctx.fillText('Need at least 2 players to start', canvas.width / 2, canvas.height / 2 + 36);
+  }
+}
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
